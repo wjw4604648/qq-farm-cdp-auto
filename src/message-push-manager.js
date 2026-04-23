@@ -1,0 +1,953 @@
+"use strict";
+
+const fs = require("node:fs/promises");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { readAutoFarmDailyStats } = require("./auto-farm-daily-stats");
+
+const MESSAGE_PUSH_STATE_VERSION = 1;
+const MESSAGE_PUSH_HISTORY_LIMIT = 20;
+const SUPPORTED_CHANNEL_TYPES = [
+  "serverchan",
+  "pushplus",
+  "wecom",
+  "dingtalk",
+  "feishu",
+  "telegram",
+  "bark",
+  "ntfy",
+  "webhook",
+];
+
+const CHANNEL_LABELS = {
+  serverchan: "Server酱",
+  pushplus: "PushPlus",
+  wecom: "企业微信机器人",
+  dingtalk: "钉钉机器人",
+  feishu: "飞书机器人",
+  telegram: "Telegram Bot",
+  bark: "Bark",
+  ntfy: "ntfy",
+  webhook: "通用 Webhook",
+};
+
+function toBool(value, defaultValue) {
+  if (value == null) return defaultValue;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const text = String(value).trim().toLowerCase();
+  if (!text) return defaultValue;
+  if (["1", "true", "yes", "on"].includes(text)) return true;
+  if (["0", "false", "no", "off"].includes(text)) return false;
+  return defaultValue;
+}
+
+function toInt(value, defaultValue, min, max) {
+  const n = Number.parseInt(String(value ?? ""), 10);
+  const resolved = Number.isFinite(n) ? n : defaultValue;
+  return Math.min(max, Math.max(min, resolved));
+}
+
+function toStringValue(value, fallback = "") {
+  return value == null ? fallback : String(value);
+}
+
+function normalizeClockText(value, fallback) {
+  const text = String(value == null ? "" : value).trim();
+  const match = /^(\d{1,2}):(\d{1,2})$/.exec(text);
+  if (!match) return fallback;
+  const hours = Number.parseInt(match[1], 10);
+  const minutes = Number.parseInt(match[2], 10);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return fallback;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return fallback;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function normalizeChannelList(value) {
+  const source = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[\r\n,，;；]+/)
+      : [];
+  const next = [];
+  for (const item of source) {
+    const type = String(item == null ? "" : item).trim().toLowerCase();
+    if (!SUPPORTED_CHANNEL_TYPES.includes(type) || next.includes(type)) continue;
+    next.push(type);
+  }
+  return next;
+}
+
+function normalizeWebhookMethod(value) {
+  const method = String(value == null ? "" : value).trim().toUpperCase();
+  return ["POST", "PUT", "PATCH"].includes(method) ? method : "POST";
+}
+
+function getConfiguredChannelTypes(config) {
+  const next = [];
+  const channels = config && config.channels ? config.channels : {};
+  if (channels.serverChanSendKey) next.push("serverchan");
+  if (channels.pushPlusToken) next.push("pushplus");
+  if (channels.wecomWebhook) next.push("wecom");
+  if (channels.dingtalkWebhook) next.push("dingtalk");
+  if (channels.feishuWebhook) next.push("feishu");
+  if (channels.telegramBotToken && channels.telegramChatId) next.push("telegram");
+  if (channels.barkDeviceKey) next.push("bark");
+  if (channels.ntfyTopic) next.push("ntfy");
+  if (channels.webhookUrl) next.push("webhook");
+  return next;
+}
+
+function resolveSelectedChannelTypes(configLike) {
+  const selected = normalizeChannelList(configLike && configLike.selectedChannels ? configLike.selectedChannels : []);
+  if (selected.length > 0) return selected;
+  const legacy = normalizeChannelList(
+    []
+      .concat(Array.isArray(configLike && configLike.abnormalChannels) ? configLike.abnormalChannels : [])
+      .concat(Array.isArray(configLike && configLike.dailyChannels) ? configLike.dailyChannels : [])
+  );
+  if (legacy.length > 0) return legacy;
+  return getConfiguredChannelTypes(configLike);
+}
+
+function normalizeMessagePushConfig(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const channels = src.channels && typeof src.channels === "object" ? src.channels : {};
+  const selectedChannels = resolveSelectedChannelTypes({
+    selectedChannels: src.selectedChannels,
+    abnormalChannels: src.abnormalChannels,
+    dailyChannels: src.dailyChannels,
+    channels,
+  });
+  return {
+    enabled: toBool(src.enabled, false),
+    abnormalEnabled: toBool(src.abnormalEnabled, true),
+    abnormalTimeoutThreshold: toInt(src.abnormalTimeoutThreshold, 3, 1, 99),
+    selectedChannels,
+    dailyEnabled: toBool(src.dailyEnabled, false),
+    dailyTime: normalizeClockText(src.dailyTime, "09:00"),
+    logMonitorEnabled: toBool(src.logMonitorEnabled, true),
+    logScanIntervalSec: toInt(src.logScanIntervalSec, 15, 5, 3600),
+    httpTimeoutMs: toInt(src.httpTimeoutMs, 10000, 1000, 120000),
+    channels: {
+      serverChanSendKey: toStringValue(channels.serverChanSendKey).trim(),
+      pushPlusToken: toStringValue(channels.pushPlusToken).trim(),
+      wecomWebhook: toStringValue(channels.wecomWebhook).trim(),
+      dingtalkWebhook: toStringValue(channels.dingtalkWebhook).trim(),
+      dingtalkSecret: toStringValue(channels.dingtalkSecret).trim(),
+      feishuWebhook: toStringValue(channels.feishuWebhook).trim(),
+      telegramBotToken: toStringValue(channels.telegramBotToken).trim(),
+      telegramChatId: toStringValue(channels.telegramChatId).trim(),
+      barkServerUrl: toStringValue(channels.barkServerUrl, "https://api.day.app").trim() || "https://api.day.app",
+      barkDeviceKey: toStringValue(channels.barkDeviceKey).trim(),
+      ntfyServerUrl: toStringValue(channels.ntfyServerUrl, "https://ntfy.sh").trim() || "https://ntfy.sh",
+      ntfyTopic: toStringValue(channels.ntfyTopic).trim(),
+      webhookUrl: toStringValue(channels.webhookUrl).trim(),
+      webhookMethod: normalizeWebhookMethod(channels.webhookMethod),
+      webhookHeaders: toStringValue(channels.webhookHeaders).trim(),
+    },
+  };
+}
+
+function buildChannelMetaList(config) {
+  const configured = new Set(getConfiguredChannelTypes(config));
+  return SUPPORTED_CHANNEL_TYPES.map((type) => ({
+    type,
+    label: CHANNEL_LABELS[type] || type,
+    configured: configured.has(type),
+  }));
+}
+
+function parseClockMinutes(value) {
+  const match = /^(\d{1,2}):(\d{1,2})$/.exec(String(value == null ? "" : value).trim());
+  if (!match) return null;
+  const hours = Number.parseInt(match[1], 10);
+  const minutes = Number.parseInt(match[2], 10);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return hours * 60 + minutes;
+}
+
+function getDateKeyLocal(date) {
+  const cur = date instanceof Date ? date : new Date(date || Date.now());
+  const year = cur.getFullYear();
+  const month = String(cur.getMonth() + 1).padStart(2, "0");
+  const day = String(cur.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function shiftDateKey(dateKey, deltaDays) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateKey || ""))) return null;
+  const [year, month, day] = String(dateKey).split("-").map((item) => Number.parseInt(item, 10));
+  const date = new Date(year, month - 1, day);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setDate(date.getDate() + (Number(deltaDays) || 0));
+  return getDateKeyLocal(date);
+}
+
+function getNowMinutes(date) {
+  const cur = date instanceof Date ? date : new Date(date || Date.now());
+  return cur.getHours() * 60 + cur.getMinutes();
+}
+
+function limitText(text, maxLength) {
+  const raw = String(text == null ? "" : text);
+  if (raw.length <= maxLength) return raw;
+  return `${raw.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function formatDateTime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const datePart = getDateKeyLocal(date);
+  const timePart = [
+    String(date.getHours()).padStart(2, "0"),
+    String(date.getMinutes()).padStart(2, "0"),
+    String(date.getSeconds()).padStart(2, "0"),
+  ].join(":");
+  return `${datePart} ${timePart}`;
+}
+
+function createEmptyRuntimeState() {
+  return {
+    version: MESSAGE_PUSH_STATE_VERSION,
+    lastScanAt: null,
+    lastTimeoutAt: null,
+    lastRecoveryAt: null,
+    consecutiveTimeouts: 0,
+    timeoutAlertActive: false,
+    recentTimeoutLines: [],
+    lastAbnormalNotificationAt: null,
+    lastAbnormalNotificationText: null,
+    lastDailySummaryDateKey: null,
+    lastDailySummaryAt: null,
+    recentPushes: [],
+    logFiles: {},
+  };
+}
+
+function normalizeRuntimeState(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const logFiles = src.logFiles && typeof src.logFiles === "object" ? src.logFiles : {};
+  const nextLogFiles = {};
+  Object.keys(logFiles).forEach((key) => {
+    const item = logFiles[key];
+    const position = Number(item && item.position);
+    nextLogFiles[key] = {
+      position: Number.isFinite(position) && position >= 0 ? position : 0,
+    };
+  });
+  const recentPushes = Array.isArray(src.recentPushes) ? src.recentPushes : [];
+  return {
+    version: MESSAGE_PUSH_STATE_VERSION,
+    lastScanAt: src.lastScanAt ? String(src.lastScanAt) : null,
+    lastTimeoutAt: src.lastTimeoutAt ? String(src.lastTimeoutAt) : null,
+    lastRecoveryAt: src.lastRecoveryAt ? String(src.lastRecoveryAt) : null,
+    consecutiveTimeouts: Math.max(0, Number(src.consecutiveTimeouts) || 0),
+    timeoutAlertActive: src.timeoutAlertActive === true,
+    recentTimeoutLines: Array.isArray(src.recentTimeoutLines)
+      ? src.recentTimeoutLines.map((item) => limitText(item, 300)).slice(-5)
+      : [],
+    lastAbnormalNotificationAt: src.lastAbnormalNotificationAt ? String(src.lastAbnormalNotificationAt) : null,
+    lastAbnormalNotificationText: src.lastAbnormalNotificationText ? String(src.lastAbnormalNotificationText) : null,
+    lastDailySummaryDateKey: src.lastDailySummaryDateKey ? String(src.lastDailySummaryDateKey) : null,
+    lastDailySummaryAt: src.lastDailySummaryAt ? String(src.lastDailySummaryAt) : null,
+    recentPushes: recentPushes
+      .map((item) => ({
+        time: item && item.time ? String(item.time) : null,
+        kind: item && item.kind ? String(item.kind) : null,
+        title: item && item.title ? limitText(item.title, 120) : null,
+        ok: item && item.ok === true,
+        channels: Array.isArray(item && item.channels) ? normalizeChannelList(item.channels) : [],
+        error: item && item.error ? limitText(item.error, 240) : null,
+      }))
+      .slice(-MESSAGE_PUSH_HISTORY_LIMIT),
+    logFiles: nextLogFiles,
+  };
+}
+
+function buildTimeoutRegexList() {
+  return [
+    /网络连接超时/i,
+    /连接超时/i,
+    /\btimed out\b/i,
+    /\btimeout\b/i,
+    /CDP timeout/i,
+    /qq ws call timed out/i,
+    /等待小游戏 .*超时/i,
+  ];
+}
+
+function buildRecoveryRegexList() {
+  return [
+    /miniapp client connected/i,
+    /小游戏 context 已就绪/i,
+    /execution context.*就绪/i,
+    /已连接/i,
+    /recovered/i,
+  ];
+}
+
+function isTimeoutLogLine(line) {
+  const text = String(line || "").trim();
+  if (!text) return false;
+  return buildTimeoutRegexList().some((pattern) => pattern.test(text));
+}
+
+function isRecoveryLogLine(line) {
+  const text = String(line || "").trim();
+  if (!text) return false;
+  return buildRecoveryRegexList().some((pattern) => pattern.test(text));
+}
+
+function stateFilePath(projectRoot) {
+  return path.join(projectRoot, "data", "message-push-state.json");
+}
+
+async function loadRuntimeState(projectRoot) {
+  try {
+    const raw = await fs.readFile(stateFilePath(projectRoot), "utf8");
+    return normalizeRuntimeState(JSON.parse(raw));
+  } catch (_) {
+    return createEmptyRuntimeState();
+  }
+}
+
+async function saveRuntimeState(projectRoot, state) {
+  const filePath = stateFilePath(projectRoot);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const normalized = normalizeRuntimeState(state);
+  await fs.writeFile(filePath, JSON.stringify(normalized, null, 2), "utf8");
+}
+
+function parseWebhookHeaders(raw) {
+  const text = String(raw == null ? "" : raw).trim();
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {}
+  const headers = {};
+  text.split(/\r?\n/).forEach((line) => {
+    const index = line.indexOf(":");
+    if (index <= 0) return;
+    const key = line.slice(0, index).trim();
+    const value = line.slice(index + 1).trim();
+    if (!key) return;
+    headers[key] = value;
+  });
+  return headers;
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("request timeout")), Math.max(1000, Number(timeoutMs) || 10000));
+  try {
+    return await fetch(url, {
+      ...(options && typeof options === "object" ? options : {}),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readAppendedText(filePath, fromPosition) {
+  let handle = null;
+  try {
+    const stat = await fs.stat(filePath);
+    const start = Number.isFinite(fromPosition) && fromPosition >= 0 ? fromPosition : stat.size;
+    if (stat.size < start) {
+      return {
+        text: "",
+        nextPosition: 0,
+        size: stat.size,
+      };
+    }
+    if (stat.size === start) {
+      return {
+        text: "",
+        nextPosition: start,
+        size: stat.size,
+      };
+    }
+    const length = stat.size - start;
+    handle = await fs.open(filePath, "r");
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, start);
+    return {
+      text: buffer.toString("utf8"),
+      nextPosition: stat.size,
+      size: stat.size,
+    };
+  } finally {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch (_) {}
+    }
+  }
+}
+
+function joinUrl(base, suffix) {
+  const normalizedBase = String(base || "").replace(/\/+$/, "");
+  const normalizedSuffix = String(suffix || "").replace(/^\/+/, "");
+  return `${normalizedBase}/${normalizedSuffix}`;
+}
+
+function createMessagePayload(kind, title, lines, meta) {
+  const lineList = Array.isArray(lines) ? lines.filter(Boolean).map((item) => String(item)) : [];
+  return {
+    kind,
+    title: String(title || "农场消息通知"),
+    plainText: [title, ...lineList].filter(Boolean).join("\n"),
+    markdownText: [`# ${title}`, ...lineList.map((item) => `- ${item}`)].join("\n"),
+    lines: lineList,
+    meta: meta && typeof meta === "object" ? { ...meta } : {},
+  };
+}
+
+async function sendToServerChan(config, payload) {
+  const sendKey = config.channels.serverChanSendKey;
+  const body = new URLSearchParams({
+    title: payload.title,
+    desp: payload.markdownText,
+  });
+  const response = await fetchWithTimeout(`https://sctapi.ftqq.com/${encodeURIComponent(sendKey)}.send`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+    body,
+  }, config.httpTimeoutMs);
+  if (!response.ok) {
+    throw new Error(`Server酱 HTTP ${response.status}`);
+  }
+}
+
+async function sendToPushPlus(config, payload) {
+  const response = await fetchWithTimeout("https://www.pushplus.plus/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      token: config.channels.pushPlusToken,
+      title: payload.title,
+      content: payload.markdownText,
+      template: "markdown",
+    }),
+  }, config.httpTimeoutMs);
+  if (!response.ok) {
+    throw new Error(`PushPlus HTTP ${response.status}`);
+  }
+}
+
+async function sendToWecom(config, payload) {
+  const response = await fetchWithTimeout(config.channels.wecomWebhook, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      msgtype: "markdown",
+      markdown: {
+        content: payload.markdownText,
+      },
+    }),
+  }, config.httpTimeoutMs);
+  if (!response.ok) {
+    throw new Error(`企业微信 HTTP ${response.status}`);
+  }
+}
+
+function buildDingtalkSignedUrl(webhook, secret) {
+  if (!secret) return webhook;
+  const timestamp = Date.now();
+  const sign = crypto
+    .createHmac("sha256", secret)
+    .update(`${timestamp}\n${secret}`)
+    .digest("base64");
+  const signParam = encodeURIComponent(sign);
+  const divider = webhook.includes("?") ? "&" : "?";
+  return `${webhook}${divider}timestamp=${timestamp}&sign=${signParam}`;
+}
+
+async function sendToDingtalk(config, payload) {
+  const response = await fetchWithTimeout(buildDingtalkSignedUrl(config.channels.dingtalkWebhook, config.channels.dingtalkSecret), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      msgtype: "markdown",
+      markdown: {
+        title: payload.title,
+        text: payload.markdownText,
+      },
+    }),
+  }, config.httpTimeoutMs);
+  if (!response.ok) {
+    throw new Error(`钉钉 HTTP ${response.status}`);
+  }
+}
+
+async function sendToFeishu(config, payload) {
+  const response = await fetchWithTimeout(config.channels.feishuWebhook, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      msg_type: "text",
+      content: {
+        text: payload.plainText,
+      },
+    }),
+  }, config.httpTimeoutMs);
+  if (!response.ok) {
+    throw new Error(`飞书 HTTP ${response.status}`);
+  }
+}
+
+async function sendToTelegram(config, payload) {
+  const url = `https://api.telegram.org/bot${encodeURIComponent(config.channels.telegramBotToken)}/sendMessage`;
+  const response = await fetchWithTimeout(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: config.channels.telegramChatId,
+      text: payload.plainText,
+      disable_web_page_preview: true,
+    }),
+  }, config.httpTimeoutMs);
+  if (!response.ok) {
+    throw new Error(`Telegram HTTP ${response.status}`);
+  }
+}
+
+async function sendToBark(config, payload) {
+  const barkUrl = joinUrl(
+    joinUrl(config.channels.barkServerUrl, config.channels.barkDeviceKey),
+    `${encodeURIComponent(payload.title)}/${encodeURIComponent(payload.lines.join("\n"))}`,
+  );
+  const response = await fetchWithTimeout(barkUrl, {
+    method: "GET",
+  }, config.httpTimeoutMs);
+  if (!response.ok) {
+    throw new Error(`Bark HTTP ${response.status}`);
+  }
+}
+
+async function sendToNtfy(config, payload) {
+  const response = await fetchWithTimeout(joinUrl(config.channels.ntfyServerUrl, config.channels.ntfyTopic), {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Title": payload.title,
+      "Tags": "seedling,warning",
+    },
+    body: payload.plainText,
+  }, config.httpTimeoutMs);
+  if (!response.ok) {
+    throw new Error(`ntfy HTTP ${response.status}`);
+  }
+}
+
+async function sendToWebhook(config, payload) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...parseWebhookHeaders(config.channels.webhookHeaders),
+  };
+  const response = await fetchWithTimeout(config.channels.webhookUrl, {
+    method: config.channels.webhookMethod,
+    headers,
+    body: JSON.stringify({
+      source: "qq-farm-cdp-auto",
+      title: payload.title,
+      text: payload.plainText,
+      markdown: payload.markdownText,
+      kind: payload.kind,
+      meta: payload.meta,
+      sentAt: new Date().toISOString(),
+    }),
+  }, config.httpTimeoutMs);
+  if (!response.ok) {
+    throw new Error(`Webhook HTTP ${response.status}`);
+  }
+}
+
+async function sendByChannel(type, config, payload) {
+  if (type === "serverchan") return await sendToServerChan(config, payload);
+  if (type === "pushplus") return await sendToPushPlus(config, payload);
+  if (type === "wecom") return await sendToWecom(config, payload);
+  if (type === "dingtalk") return await sendToDingtalk(config, payload);
+  if (type === "feishu") return await sendToFeishu(config, payload);
+  if (type === "telegram") return await sendToTelegram(config, payload);
+  if (type === "bark") return await sendToBark(config, payload);
+  if (type === "ntfy") return await sendToNtfy(config, payload);
+  if (type === "webhook") return await sendToWebhook(config, payload);
+  throw new Error(`unsupported channel: ${type}`);
+}
+
+function pickAvailableChannels(config, requestedTypes) {
+  const configured = new Set(getConfiguredChannelTypes(config));
+  const source = requestedTypes != null
+    ? requestedTypes
+    : resolveSelectedChannelTypes(config);
+  return normalizeChannelList(source).filter((type) => configured.has(type));
+}
+
+function buildStatusSummaryLines(statusSnapshot) {
+  const state = statusSnapshot && typeof statusSnapshot === "object" ? statusSnapshot : null;
+  if (!state) return [];
+  const summary = [];
+  summary.push(`自动农场：${state.running ? "运行中" : "已停止"}`);
+  if (state.busy) {
+    summary.push("当前轮次执行中");
+  }
+  if (state.runtime && state.runtime.resolvedTarget) {
+    summary.push(`运行时：${state.runtime.resolvedTarget}`);
+  }
+  if (state.nextRunAt) {
+    summary.push(`下次调度：${formatDateTime(state.nextRunAt)}`);
+  }
+  if (state.lastFinishedAt) {
+    summary.push(`上次完成：${formatDateTime(state.lastFinishedAt)}`);
+  }
+  if (state.lastError) {
+    summary.push(`最近错误：${state.lastError}`);
+  }
+  return summary;
+}
+
+function buildAbnormalPayload(runtimeState, threshold, statusSnapshot) {
+  const recentLines = Array.isArray(runtimeState.recentTimeoutLines) ? runtimeState.recentTimeoutLines : [];
+  const lines = [
+    `异常类型：连接超时累计达到 ${runtimeState.consecutiveTimeouts} 次（阈值 ${threshold}）`,
+    runtimeState.lastTimeoutAt ? `最近超时：${formatDateTime(runtimeState.lastTimeoutAt)}` : "",
+    ...buildStatusSummaryLines(statusSnapshot),
+    recentLines.length ? `最近日志：${recentLines.slice(-3).join(" | ")}` : "",
+  ].filter(Boolean);
+  return createMessagePayload("abnormal", "农场异常通知", lines, {
+    consecutiveTimeouts: runtimeState.consecutiveTimeouts,
+    lastTimeoutAt: runtimeState.lastTimeoutAt,
+    recentTimeoutLines: recentLines.slice(-3),
+  });
+}
+
+function buildDailyPayload(stats, dateKey) {
+  const src = stats && typeof stats === "object" ? stats : {};
+  const lines = [
+    `统计日期：${dateKey}`,
+    `总运行 ${Number(src.runs) || 0} 轮，自己 ${Number(src.ownRuns) || 0} 轮，好友 ${Number(src.friendRuns) || 0} 轮`,
+    `收获 ${Number(src.collect) || 0}，浇水 ${Number(src.water) || 0}，除草 ${Number(src.eraseGrass) || 0}，杀虫 ${Number(src.killBug) || 0}`,
+    `施肥 ${Number(src.fertilize) || 0}，种植 ${Number(src.plant) || 0}，偷菜 ${Number(src.steal) || 0}`,
+    `帮浇水 ${Number(src.helpWater) || 0}，帮除草 ${Number(src.helpEraseGrass) || 0}，帮除虫 ${Number(src.helpKillBug) || 0}`,
+    `出售次数 ${Number(src.sell) || 0}，出售金币 ${Number(src.sellGold) || 0}`,
+  ];
+  return createMessagePayload("daily", `农场日报 ${dateKey}`, lines, {
+    dateKey,
+    stats: src,
+  });
+}
+
+class MessagePushManager {
+  constructor(opts) {
+    const options = opts && typeof opts === "object" ? opts : {};
+    this.projectRoot = options.projectRoot;
+    this.logFiles = Array.isArray(options.logFiles) ? options.logFiles.filter(Boolean) : [];
+    this.getStatusSnapshot = typeof options.getStatusSnapshot === "function"
+      ? options.getStatusSnapshot
+      : null;
+    this.config = normalizeMessagePushConfig(options.initialConfig);
+    this.runtimeState = createEmptyRuntimeState();
+    this.partialLineMap = new Map();
+    this.timer = null;
+    this.running = false;
+    this.tickPromise = Promise.resolve();
+    this.lastPersistPromise = Promise.resolve();
+  }
+
+  async init() {
+    this.runtimeState = await loadRuntimeState(this.projectRoot);
+    await this._ensureLogCursorsInitialized();
+    await this._persistState();
+  }
+
+  updateConfig(raw) {
+    this.config = normalizeMessagePushConfig(raw);
+    if (this.running) {
+      this._scheduleNextTick(500);
+    }
+    return this.config;
+  }
+
+  getState() {
+    const config = this.config;
+    const availableChannels = buildChannelMetaList(config);
+    const configuredTypes = getConfiguredChannelTypes(config);
+    const dailyMinutes = parseClockMinutes(config.dailyTime);
+    const now = new Date();
+    let nextDailyDateTime = null;
+    if (dailyMinutes != null) {
+      const next = new Date(now.getTime());
+      next.setHours(Math.floor(dailyMinutes / 60), dailyMinutes % 60, 0, 0);
+      if (next.getTime() <= now.getTime()) {
+        next.setDate(next.getDate() + 1);
+      }
+      nextDailyDateTime = next.toISOString();
+    }
+    return {
+      enabled: config.enabled,
+      config,
+      configuredChannels: configuredTypes,
+      channels: availableChannels,
+      abnormal: {
+        enabled: config.enabled && config.abnormalEnabled,
+        channels: pickAvailableChannels(config),
+        threshold: config.abnormalTimeoutThreshold,
+        consecutiveTimeouts: this.runtimeState.consecutiveTimeouts,
+        alertActive: this.runtimeState.timeoutAlertActive,
+        lastTimeoutAt: this.runtimeState.lastTimeoutAt,
+        lastRecoveryAt: this.runtimeState.lastRecoveryAt,
+        recentTimeoutLines: [...this.runtimeState.recentTimeoutLines],
+        lastNotificationAt: this.runtimeState.lastAbnormalNotificationAt,
+        lastNotificationText: this.runtimeState.lastAbnormalNotificationText,
+      },
+      daily: {
+        enabled: config.enabled && config.dailyEnabled,
+        channels: pickAvailableChannels(config),
+        time: config.dailyTime,
+        nextRunAt: nextDailyDateTime,
+        lastSummaryDateKey: this.runtimeState.lastDailySummaryDateKey,
+        lastSummaryAt: this.runtimeState.lastDailySummaryAt,
+      },
+      recentPushes: [...this.runtimeState.recentPushes].reverse(),
+      lastScanAt: this.runtimeState.lastScanAt,
+      logMonitorEnabled: config.enabled && config.logMonitorEnabled,
+    };
+  }
+
+  async start() {
+    if (this.running) return;
+    this.running = true;
+    if (!this.runtimeState || !this.runtimeState.version) {
+      await this.init();
+    }
+    this._scheduleNextTick(1000);
+  }
+
+  async close() {
+    this.running = false;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    await this.lastPersistPromise.catch(() => {});
+  }
+
+  async sendTest(customConfig) {
+    const config = normalizeMessagePushConfig(customConfig || this.config);
+    const candidates = new Set([...pickAvailableChannels(config), ...getConfiguredChannelTypes(config)]);
+    const channelTypes = Array.from(candidates);
+    if (!channelTypes.length) {
+      throw new Error("未配置任何可用推送渠道");
+    }
+    const payload = createMessagePayload("test", "农场测试推送", [
+      "这是一条测试消息，用于验证渠道配置是否可用。",
+      `发送时间：${formatDateTime(new Date())}`,
+      "如果你收到了这条消息，说明当前渠道已经可以正常接收通知。",
+    ], {});
+    return await this._sendPayload(config, channelTypes, payload);
+  }
+
+  async _scheduleTick() {
+    if (!this.running) return;
+    this.tickPromise = this.tickPromise
+      .catch(() => {})
+      .then(async () => {
+        await this._runTick();
+      });
+    await this.tickPromise;
+  }
+
+  _scheduleNextTick(delayMs) {
+    if (!this.running) return;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    const delay = Math.max(250, Number(delayMs) || this.config.logScanIntervalSec * 1000);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this._scheduleTick();
+    }, delay);
+  }
+
+  async _runTick() {
+    try {
+      await this._scanLogs();
+      await this._maybeSendDailySummary();
+      this.runtimeState.lastScanAt = new Date().toISOString();
+      await this._persistState();
+    } finally {
+      this._scheduleNextTick(this.config.logScanIntervalSec * 1000);
+    }
+  }
+
+  async _ensureLogCursorsInitialized() {
+    for (const filePath of this.logFiles) {
+      const key = path.relative(this.projectRoot, filePath) || filePath;
+      if (this.runtimeState.logFiles[key]) continue;
+      try {
+        const stat = await fs.stat(filePath);
+        this.runtimeState.logFiles[key] = { position: stat.size };
+      } catch (_) {
+        this.runtimeState.logFiles[key] = { position: 0 };
+      }
+    }
+  }
+
+  async _scanLogs() {
+    if (!(this.config.enabled && this.config.logMonitorEnabled)) return;
+    for (const filePath of this.logFiles) {
+      const key = path.relative(this.projectRoot, filePath) || filePath;
+      const cursor = this.runtimeState.logFiles[key] || { position: 0 };
+      let result;
+      try {
+        result = await readAppendedText(filePath, cursor.position);
+      } catch (_) {
+        continue;
+      }
+      this.runtimeState.logFiles[key] = {
+        position: result.nextPosition,
+      };
+      if (!result.text) continue;
+      const leftover = this.partialLineMap.get(key) || "";
+      const merged = `${leftover}${result.text}`;
+      const lines = merged.split(/\r?\n/);
+      const lastLine = lines.pop();
+      this.partialLineMap.set(key, lastLine || "");
+      for (const line of lines) {
+        await this._consumeLogLine(line);
+      }
+    }
+  }
+
+  async _consumeLogLine(line) {
+    const text = String(line || "").trim();
+    if (!text) return;
+    if (isTimeoutLogLine(text)) {
+      this.runtimeState.consecutiveTimeouts += 1;
+      this.runtimeState.lastTimeoutAt = new Date().toISOString();
+      this.runtimeState.recentTimeoutLines.push(limitText(text, 300));
+      if (this.runtimeState.recentTimeoutLines.length > 5) {
+        this.runtimeState.recentTimeoutLines.splice(0, this.runtimeState.recentTimeoutLines.length - 5);
+      }
+      if (
+        !this.runtimeState.timeoutAlertActive
+        && this.runtimeState.consecutiveTimeouts >= this.config.abnormalTimeoutThreshold
+        && this.config.enabled
+        && this.config.abnormalEnabled
+      ) {
+        const payload = buildAbnormalPayload(
+          this.runtimeState,
+          this.config.abnormalTimeoutThreshold,
+          this.getStatusSnapshot ? this.getStatusSnapshot() : null,
+        );
+        const channels = pickAvailableChannels(this.config);
+        if (channels.length > 0) {
+          const result = await this._sendPayload(this.config, channels, payload);
+          this.runtimeState.lastAbnormalNotificationAt = new Date().toISOString();
+          this.runtimeState.lastAbnormalNotificationText = result.summary;
+        }
+        this.runtimeState.timeoutAlertActive = true;
+      }
+      return;
+    }
+    if (isRecoveryLogLine(text)) {
+      this.runtimeState.consecutiveTimeouts = 0;
+      this.runtimeState.timeoutAlertActive = false;
+      this.runtimeState.lastRecoveryAt = new Date().toISOString();
+      this.runtimeState.recentTimeoutLines = [];
+    }
+  }
+
+  async _maybeSendDailySummary() {
+    const config = this.config;
+    if (!(config.enabled && config.dailyEnabled)) return;
+    const dailyMinutes = parseClockMinutes(config.dailyTime);
+    if (dailyMinutes == null) return;
+    if (getNowMinutes(new Date()) < dailyMinutes) return;
+    const todayKey = getDateKeyLocal(new Date());
+    const targetDateKey = shiftDateKey(todayKey, -1);
+    if (!targetDateKey) return;
+    if (this.runtimeState.lastDailySummaryDateKey === targetDateKey) return;
+    const channels = pickAvailableChannels(config);
+    if (!channels.length) return;
+    const entry = await readAutoFarmDailyStats(this.projectRoot, targetDateKey, {
+      createIfMissing: false,
+    });
+    const payload = buildDailyPayload(entry && entry.state ? entry.state : null, targetDateKey);
+    await this._sendPayload(config, channels, payload);
+    this.runtimeState.lastDailySummaryDateKey = targetDateKey;
+    this.runtimeState.lastDailySummaryAt = new Date().toISOString();
+  }
+
+  async _sendPayload(config, channelTypes, payload) {
+    const results = [];
+    for (const type of channelTypes) {
+      try {
+        await sendByChannel(type, config, payload);
+        results.push({
+          type,
+          ok: true,
+          error: null,
+        });
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        results.push({
+          type,
+          ok: false,
+          error: err.message,
+        });
+      }
+    }
+    const okCount = results.filter((item) => item.ok).length;
+    const errorCount = results.length - okCount;
+    const summary = errorCount <= 0
+      ? `已推送到 ${okCount} 个渠道`
+      : `成功 ${okCount} 个，失败 ${errorCount} 个`;
+    this.runtimeState.recentPushes.push({
+      time: new Date().toISOString(),
+      kind: payload.kind,
+      title: payload.title,
+      ok: errorCount <= 0,
+      channels: channelTypes,
+      error: errorCount > 0
+        ? results.filter((item) => !item.ok).map((item) => `${CHANNEL_LABELS[item.type] || item.type}: ${item.error}`).join(" | ")
+        : null,
+    });
+    if (this.runtimeState.recentPushes.length > MESSAGE_PUSH_HISTORY_LIMIT) {
+      this.runtimeState.recentPushes.splice(0, this.runtimeState.recentPushes.length - MESSAGE_PUSH_HISTORY_LIMIT);
+    }
+    await this._persistState();
+    return {
+      ok: errorCount <= 0,
+      summary,
+      results,
+      payload,
+    };
+  }
+
+  async _persistState() {
+    const snapshot = normalizeRuntimeState(this.runtimeState);
+    this.lastPersistPromise = this.lastPersistPromise
+      .catch(() => {})
+      .then(async () => {
+        await saveRuntimeState(this.projectRoot, snapshot);
+      });
+    await this.lastPersistPromise;
+  }
+}
+
+module.exports = {
+  CHANNEL_LABELS,
+  MESSAGE_PUSH_STATE_VERSION,
+  SUPPORTED_CHANNEL_TYPES,
+  MessagePushManager,
+  buildChannelMetaList,
+  getConfiguredChannelTypes,
+  normalizeMessagePushConfig,
+};
